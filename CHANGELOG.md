@@ -7500,3 +7500,4 @@ Final steps in making the Option type a first class type:
 - Cleaner bytes to string conversion: `tos2(bytes)` => `string(bytes)`.
 - The home page has 3 more examples next to 'hello world' that show the features of the language.
 - Lots of bugs and issues fixed.
+
