@@ -2,6 +2,28 @@ module os
 
 fn C.setpgid(pid i32, pgid i32) i32
 
+#include <spawn.h>
+
+@[typedef]
+struct C.posix_spawn_file_actions_t {}
+
+@[typedef]
+struct C.posix_spawnattr_t {}
+
+fn C.posix_spawn_file_actions_init(fa &C.posix_spawn_file_actions_t) i32
+fn C.posix_spawn_file_actions_destroy(fa &C.posix_spawn_file_actions_t) i32
+fn C.posix_spawn_file_actions_adddup2(fa &C.posix_spawn_file_actions_t, fd i32, newfd i32) i32
+fn C.posix_spawn_file_actions_addclose(fa &C.posix_spawn_file_actions_t, fd i32) i32
+fn C.posix_spawn_file_actions_addopen(fa &C.posix_spawn_file_actions_t, fd i32, path &char, oflag i32, mode u32) i32
+fn C.posix_spawnattr_init(attr &C.posix_spawnattr_t) i32
+fn C.posix_spawnattr_destroy(attr &C.posix_spawnattr_t) i32
+fn C.posix_spawnattr_setflags(attr &C.posix_spawnattr_t, flags i16) i32
+fn C.posix_spawnattr_setpgroup(attr &C.posix_spawnattr_t, pgroup i32) i32
+fn C.posix_spawn(pid &i32, path &char, fa &C.posix_spawn_file_actions_t, attr &C.posix_spawnattr_t, argv &&char, envp &&char) i32
+
+// posix_spawn_setpgroup is POSIX_SPAWN_SETPGROUP, the same value in glibc and musl.
+const posix_spawn_setpgroup = 2
+
 // child_spawn_code_prefix is the `; code: N` separator that `IError.str()` adds.
 // It is a literal, so the forked child can copy it without allocating.
 const child_spawn_code_prefix = '; code: '
@@ -139,6 +161,61 @@ fn unix_child_report_errno(prefix string) {
 	unsafe { C.write(2, &buf[0], uint(n)) }
 }
 
+// unix_try_posix_spawn starts the child with posix_spawn and returns its pid, or -1 when the
+// spawn has to be done by fork() instead. fork() copies the page tables of the parent, which
+// costs about 30 ms per spawn in a compiler process of 1 GB; posix_spawn shares the address
+// space until the child has called execve. A spawn that needs a work folder, or whose
+// executable cannot be resolved, or that posix_spawn refuses for any reason, is left to the
+// fork path, which has the established way of reporting those errors from the child.
+fn (p &Process) unix_try_posix_spawn(plan UnixSpawnPlan, pipeset [6]i32) int {
+	if p.work_folder != '' || plan.resolve_error.len > 0 {
+		return -1
+	}
+	mut actions := C.posix_spawn_file_actions_t{}
+	if C.posix_spawn_file_actions_init(&actions) != 0 {
+		return -1
+	}
+	mut attr := C.posix_spawnattr_t{}
+	if C.posix_spawnattr_init(&attr) != 0 {
+		C.posix_spawn_file_actions_destroy(&actions)
+		return -1
+	}
+	mut ok := true
+	if p.use_pgroup {
+		ok = C.posix_spawnattr_setflags(&attr, i16(posix_spawn_setpgroup)) == 0
+			&& C.posix_spawnattr_setpgroup(&attr, 0) == 0
+	}
+	if ok && p.has_stdin_path {
+		ok = C.posix_spawn_file_actions_addopen(&actions, 0, &char(p.stdin_path.str), o_rdonly, 0) == 0
+	}
+	if ok && p.use_stdio_ctl {
+		if !p.has_stdin_path {
+			ok = C.posix_spawn_file_actions_adddup2(&actions, pipeset[0], 0) == 0
+		}
+		ok = ok && C.posix_spawn_file_actions_adddup2(&actions, pipeset[3], 1) == 0
+		ok = ok && C.posix_spawn_file_actions_adddup2(&actions, if p.merge_stdio {
+			pipeset[3]
+		} else {
+			pipeset[5]
+		}, 2) == 0
+		// The child only keeps the redirected 0, 1 and 2.
+		for fd in [pipeset[0], pipeset[1], pipeset[2], pipeset[3], pipeset[4], pipeset[5]] {
+			if ok && fd > 2 && !(fd == pipeset[0] && p.has_stdin_path)
+				&& !(fd == pipeset[1] && p.has_stdin_path) && !(p.merge_stdio && (fd == pipeset[4] || fd == pipeset[5])) {
+				ok = C.posix_spawn_file_actions_addclose(&actions, fd) == 0
+			}
+		}
+	}
+	mut child := i32(0)
+	if ok {
+		ok = C.posix_spawn(&child, &char(plan.exe.str), &actions, &attr, plan.argv.data,
+			plan.envp.data) == 0
+	}
+	C.posix_spawn_file_actions_destroy(&actions)
+	C.posix_spawnattr_destroy(&attr)
+	return if ok { int(child) } else { -1 }
+}
+
 fn (mut p Process) unix_spawn_process() int {
 	// Each `C.pipe` writes two C `int` file descriptors; back them with `i32` so the
 	// buffer matches the C ABI (a V `[6]int` is six 64-bit slots now that `int` is
@@ -159,7 +236,13 @@ fn (mut p Process) unix_spawn_process() int {
 	// Resolve the executable and build the C argv/envp vectors *before* forking;
 	// doing it in the child would allocate, and can deadlock there.
 	plan := p.unix_prepare_spawn()
-	pid := fork()
+	mut pid := -1
+	$if linux {
+		pid = p.unix_try_posix_spawn(plan, pipeset)
+	}
+	if pid < 0 {
+		pid = fork()
+	}
 	if pid != 0 {
 		// This is the parent process after the fork.
 		// Note: pid contains the process ID of the child process
