@@ -2,27 +2,11 @@ module os
 
 fn C.setpgid(pid i32, pgid i32) i32
 
-#include <spawn.h>
+// The posix_spawn calls are in a C object of their own: an `#include <spawn.h>` in this file
+// would put V's whole platform header block into every program that imports `os`.
+#flag linux @VEXEROOT/vlib/os/posix_spawn_nix.o
 
-@[typedef]
-struct C.posix_spawn_file_actions_t {}
-
-@[typedef]
-struct C.posix_spawnattr_t {}
-
-fn C.posix_spawn_file_actions_init(fa &C.posix_spawn_file_actions_t) i32
-fn C.posix_spawn_file_actions_destroy(fa &C.posix_spawn_file_actions_t) i32
-fn C.posix_spawn_file_actions_adddup2(fa &C.posix_spawn_file_actions_t, fd i32, newfd i32) i32
-fn C.posix_spawn_file_actions_addclose(fa &C.posix_spawn_file_actions_t, fd i32) i32
-fn C.posix_spawn_file_actions_addopen(fa &C.posix_spawn_file_actions_t, fd i32, path &char, oflag i32, mode u32) i32
-fn C.posix_spawnattr_init(attr &C.posix_spawnattr_t) i32
-fn C.posix_spawnattr_destroy(attr &C.posix_spawnattr_t) i32
-fn C.posix_spawnattr_setflags(attr &C.posix_spawnattr_t, flags i16) i32
-fn C.posix_spawnattr_setpgroup(attr &C.posix_spawnattr_t, pgroup i32) i32
-fn C.posix_spawn(pid &i32, path &char, fa &C.posix_spawn_file_actions_t, attr &C.posix_spawnattr_t, argv &&char, envp &&char) i32
-
-// posix_spawn_setpgroup is POSIX_SPAWN_SETPGROUP, the same value in glibc and musl.
-const posix_spawn_setpgroup = 2
+fn C.v_os_posix_spawn(exe &char, argv &&char, envp &&char, use_pgroup i32, stdin_path &char, redirect i32, stdin_fd i32, out_fd i32, err_fd i32, close_fds &i32, n_close i32) i32
 
 // child_spawn_code_prefix is the `; code: N` separator that `IError.str()` adds.
 // It is a literal, so the forked child can copy it without allocating.
@@ -171,49 +155,25 @@ fn (p &Process) unix_try_posix_spawn(plan UnixSpawnPlan, pipeset [6]i32) int {
 	if p.work_folder != '' || plan.resolve_error.len > 0 {
 		return -1
 	}
-	mut actions := C.posix_spawn_file_actions_t{}
-	if C.posix_spawn_file_actions_init(&actions) != 0 {
-		return -1
-	}
-	mut attr := C.posix_spawnattr_t{}
-	if C.posix_spawnattr_init(&attr) != 0 {
-		C.posix_spawn_file_actions_destroy(&actions)
-		return -1
-	}
-	mut ok := true
-	if p.use_pgroup {
-		ok = C.posix_spawnattr_setflags(&attr, i16(posix_spawn_setpgroup)) == 0
-			&& C.posix_spawnattr_setpgroup(&attr, 0) == 0
-	}
-	if ok && p.has_stdin_path {
-		ok = C.posix_spawn_file_actions_addopen(&actions, 0, &char(p.stdin_path.str), o_rdonly, 0) == 0
-	}
-	if ok && p.use_stdio_ctl {
-		if !p.has_stdin_path {
-			ok = C.posix_spawn_file_actions_adddup2(&actions, pipeset[0], 0) == 0
-		}
-		ok = ok && C.posix_spawn_file_actions_adddup2(&actions, pipeset[3], 1) == 0
-		ok = ok && C.posix_spawn_file_actions_adddup2(&actions, if p.merge_stdio {
-			pipeset[3]
-		} else {
-			pipeset[5]
-		}, 2) == 0
+	mut close_fds := [6]i32{}
+	mut n_close := 0
+	if p.use_stdio_ctl {
 		// The child only keeps the redirected 0, 1 and 2.
 		for fd in [pipeset[0], pipeset[1], pipeset[2], pipeset[3], pipeset[4], pipeset[5]] {
-			if ok && fd > 2 && !(fd == pipeset[0] && p.has_stdin_path)
-				&& !(fd == pipeset[1] && p.has_stdin_path) && !(p.merge_stdio && (fd == pipeset[4] || fd == pipeset[5])) {
-				ok = C.posix_spawn_file_actions_addclose(&actions, fd) == 0
+			if fd > 2 && !(fd == pipeset[0] && p.has_stdin_path)
+				&& !(fd == pipeset[1] && p.has_stdin_path)
+				&& !(p.merge_stdio && (fd == pipeset[4] || fd == pipeset[5])) {
+				close_fds[n_close] = fd
+				n_close++
 			}
 		}
 	}
-	mut child := i32(0)
-	if ok {
-		ok = C.posix_spawn(&child, &char(plan.exe.str), &actions, &attr, plan.argv.data,
-			plan.envp.data) == 0
-	}
-	C.posix_spawn_file_actions_destroy(&actions)
-	C.posix_spawnattr_destroy(&attr)
-	return if ok { int(child) } else { -1 }
+	stdin_path := if p.has_stdin_path { &char(p.stdin_path.str) } else { &char(unsafe { nil }) }
+	err_fd := if p.merge_stdio { pipeset[3] } else { pipeset[5] }
+	child := C.v_os_posix_spawn(&char(plan.exe.str), plan.argv.data, plan.envp.data,
+		if p.use_pgroup { 1 } else { 0 }, stdin_path, if p.use_stdio_ctl { 1 } else { 0 },
+		pipeset[0], pipeset[3], err_fd, &close_fds[0], n_close)
+	return int(child)
 }
 
 fn (mut p Process) unix_spawn_process() int {
