@@ -51,8 +51,7 @@ fn (h HStmt) exec(sql_ string) ! {
 // retrieve_affected_rows returns number of rows affected/modified by the last operation. -1 if not applicable.
 fn (h HStmt) retrieve_affected_rows() !int {
 	count_ret := C.SQLLEN(0)
-	// SQLLEN is pointer-wide: pass the address as a voidptr, so that the C ABI shim does not
-	// swap it for the address of a 4-byte C `int` that the driver would write 8 bytes into.
+	// SQLLEN is pointer-wide; bypass the adapter for 32-bit C int out-parameters.
 	retcode := C.SQLRowCount(h.hstmt, voidptr(&count_ret))
 	check_error(retcode, 'SQLRowCount()', C.SQLHANDLE(h.hstmt), C.SQLSMALLINT(C.SQL_HANDLE_STMT))!
 	return int(count_ret)
